@@ -124,11 +124,39 @@ def process_data_streamlit(files_config):
     all_data['count'] = all_data.groupby(target_col)[target_col].transform('count')
     df_exact_3 = all_data[all_data['count'] == 3].copy()
     
-    # 提示被排除的資料
+    # =========================================================
+    # [修改部分]：找出被排除的人，並顯示詳細缺失月份
+    # =========================================================
     df_others = all_data[all_data['count'] != 3].copy()
+    
     if not df_others.empty:
+        # 1. 取得該次所有應該要有的月份 (Expected Months)
+        expected_months_set = {item['label'] for item in files_config if item['label']}
+        
         unique_excluded = df_others['Client'].unique()
         st.warning(f"⚠️ 發現 {len(unique_excluded)} 位客戶資料不完整 (非 3 個月)，已自動排除。")
+        
+        # 2. 整理詳細清單
+        missing_details = []
+        for client_name in unique_excluded:
+            # 找出這個客戶目前有的資料
+            client_rows = df_others[df_others['Client'] == client_name]
+            present_months = set(client_rows['Date'].unique())
+            
+            # 找出缺少的月份 (集合相減)
+            missing_months = expected_months_set - present_months
+            
+            missing_details.append({
+                "Client (客戶名稱)": client_name,
+                "Missing (缺失月份檔案)": ", ".join(missing_months) if missing_months else "Unknown",
+                "Found (現有月份)": ", ".join(present_months)
+            })
+        
+        # 3. 顯示成表格
+        df_missing_report = pd.DataFrame(missing_details)
+        with st.expander("📋 點擊展開：查看缺失資料詳情 (排除名單)"):
+            st.dataframe(df_missing_report, use_container_width=True)
+    # =========================================================
 
     if df_exact_3.empty:
         st.error("❌ 沒有發現剛好 3 筆資料的客戶，無法進行合併。")
@@ -188,8 +216,6 @@ def generate_invoices_streamlit(df, template_path, output_dir):
     total_rows = len(df)
     
     # [關鍵修正]：改用 to_dict('records') 而不是 itertuples
-    # itertuples 會把 'Average Daily Balance1' 變成 'Average_Daily_Balance1' 導致找不到
-    # to_dict 則會保留原始 Key string: 'Average Daily Balance1'
     records = df.to_dict('records')
     
     for idx, row in enumerate(records):
@@ -222,13 +248,13 @@ def generate_invoices_streamlit(df, template_path, output_dir):
         # 準備寫入模板的資料 (21 個欄位)
         template_data = [
             # 1-8 Header
-            Eval,                                   # 1
-            f"${Total:,.2f}",                       # 2
-            f"Client Name(s): {Client}",            # 3
-            str(Unique_Client_ID)[:10],             # 4
-            "0.25%",                                # 5
-            f"Billing Cycle: {Eval}",               # 6
-            "Address: ????",                        # 7
+            Eval,                                       # 1
+            f"${Total:,.2f}",                           # 2
+            f"Client Name(s): {Client}",                # 3
+            str(Unique_Client_ID)[:10],                 # 4
+            "0.25%",                                    # 5
+            f"Billing Cycle: {Eval}",                   # 6
+            "Address: ????",                            # 7
             f"Fee Calculation {str(Unique_Client_ID)[:10]}", # 8
             
             # 9-20 Content Rows
@@ -237,7 +263,7 @@ def generate_invoices_streamlit(df, template_path, output_dir):
             date3, avg3, days3, f"${fee3:,.2f}",    # Row 20
             
             # 21 Footer
-            f"${Total:,.2f}"                        # 21
+            f"${Total:,.2f}"                            # 21
         ]
 
         # 處理檔名中的特殊字元
@@ -324,7 +350,7 @@ if start_button:
             if not df_result.empty:
                 st.success(f"資料處理完成！共 {len(df_result)} 位合格客戶。")
                 
-                # 預覽數據 (重要：這裡可以檢查欄位是否正確生成)
+                # 預覽數據
                 st.subheader("📊 數據預覽 (請確認 Fee, Balance, Date 是否正確)")
                 preview_cols = ['Client', 'Total', 'Fee1', 'Fee2', 'Fee3', 'Date1', 'Date2', 'Date3', 'Average Daily Balance1']
                 # 只顯示存在的欄位
