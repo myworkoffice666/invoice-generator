@@ -18,7 +18,7 @@ st.markdown("""
 """)
 
 # ==========================================
-# 2. 側邊欄：參數設定 (核心修改區)
+# 2. 側邊欄：參數設定
 # ==========================================
 st.sidebar.header("📝 1. 參數設定 (請手動填寫)")
 
@@ -41,7 +41,6 @@ st.sidebar.markdown("---")
 st.sidebar.header("📂 2. 上傳檔案")
 st.sidebar.caption("請依照上述設定的月份順序上傳對應檔案。")
 
-# 使用 f-string 將使用者輸入的標籤 (P1_LABEL) 顯示在上傳按鈕上，避免傳錯
 uploaded_file_1 = st.sidebar.file_uploader(f"上傳檔案 1 ({P1_LABEL})", type=["xls", "xlsx"])
 uploaded_file_2 = st.sidebar.file_uploader(f"上傳檔案 2 ({P2_LABEL})", type=["xls", "xlsx"])
 uploaded_file_3 = st.sidebar.file_uploader(f"上傳檔案 3 ({P3_LABEL})", type=["xls", "xlsx"])
@@ -51,7 +50,7 @@ st.sidebar.header("📄 3. 上傳模板")
 uploaded_template = st.sidebar.file_uploader("上傳發票模板 (CF_template.xlsx)", type=["xlsx"])
 
 # ==========================================
-# 3. 核心邏輯 (基於您的腳本改寫)
+# 3. 核心邏輯
 # ==========================================
 
 # 模板映射定義 (維持不變)
@@ -68,7 +67,6 @@ DATA_TEMPLATE_MAPPING = [
 def process_data_streamlit(files_config):
     """
     讀取並處理資料
-    files_config: 包含 [{'file': uploaded_obj, 'label': 'Jul 2025'}, ...]
     """
     dfs = []
     
@@ -131,15 +129,13 @@ def process_data_streamlit(files_config):
     if not df_others.empty:
         unique_excluded = df_others['Client'].unique()
         st.warning(f"⚠️ 發現 {len(unique_excluded)} 位客戶資料不完整 (非 3 個月)，已自動排除。")
-        with st.expander("查看被排除的客戶名單"):
-            st.write(unique_excluded)
 
     if df_exact_3.empty:
         st.error("❌ 沒有發現剛好 3 筆資料的客戶，無法進行合併。")
         return pd.DataFrame()
 
     # --- Pivot 轉換 (轉寬表格) ---
-    # 建立期數編號 (1, 2, 3)
+    # 建立期數編號 (1, 2, 3) - 這會依據我們 append 到 dfs 的順序
     df_exact_3['period_id'] = df_exact_3.groupby(target_col).cumcount() + 1
     
     fixed_cols = ['Client', 'Advisor', 'Unique Client ID']
@@ -148,11 +144,16 @@ def process_data_streamlit(files_config):
     
     value_cols = ['Average Daily Balance', 'Days in Period', 'Fee', 'Date']
     
+    # 執行樞紐分析
     df_wide = df_exact_3.pivot(index=fixed_cols, columns='period_id', values=value_cols)
+    
+    # [重要步驟] 扁平化欄位名稱
+    # 例如: ('Average Daily Balance', 1) -> 'Average Daily Balance1'
+    # 這邊我們保留原始字串，不加底線，確保後續 generate_invoices 可以用原名抓取
     df_wide.columns = [f'{col[0]}{col[1]}' for col in df_wide.columns]
     df_wide = df_wide.reset_index()
 
-    # 欄位整理
+    # 欄位整理 (保留需要的欄位)
     desired_columns = [
         'Client', 'Advisor', 'Unique Client ID',
         'Average Daily Balance1', 'Average Daily Balance2', 'Average Daily Balance3',
@@ -160,16 +161,14 @@ def process_data_streamlit(files_config):
         'Fee1', 'Fee2', 'Fee3',
         'Date1', 'Date2', 'Date3'
     ]
+    # 這裡做交集，防止找不到欄位報錯
     final_cols = [c for c in desired_columns if c in df_wide.columns]
     df_wide = df_wide[final_cols]
     
     # --- 終極防呆：計算前再次確保 Fee 是數字 ---
     for fee_col in ["Fee1", "Fee2", "Fee3"]:
         if fee_col in df_wide.columns:
-            df_wide[fee_col] = pd.to_numeric(
-                df_wide[fee_col].astype(str).str.replace(r'[$,]', '', regex=True), 
-                errors='coerce'
-            ).fillna(0)
+            df_wide[fee_col] = pd.to_numeric(df_wide[fee_col], errors='coerce').fillna(0)
 
     # 計算總和
     df_wide["Total"] = (df_wide.get("Fee1", 0) + df_wide.get("Fee2", 0) + df_wide.get("Fee3", 0)).round(2)
@@ -188,38 +187,57 @@ def generate_invoices_streamlit(df, template_path, output_dir):
     progress_bar = st.progress(0)
     total_rows = len(df)
     
-    for idx, row in enumerate(df.itertuples(index=False)):
-        # 使用 getattr 安全獲取欄位 (防止欄位缺失報錯)
-        Client = getattr(row, "Client", "Unknown")
-        Unique_Client_ID = getattr(row, "Unique_Client_ID", getattr(row, "_2", "")) # _2 是 fallback
+    # [關鍵修正]：改用 to_dict('records') 而不是 itertuples
+    # itertuples 會把 'Average Daily Balance1' 變成 'Average_Daily_Balance1' 導致找不到
+    # to_dict 則會保留原始 Key string: 'Average Daily Balance1'
+    records = df.to_dict('records')
+    
+    for idx, row in enumerate(records):
+        # 使用 .get() 安全獲取欄位，並提供預設值
+        Client = row.get("Client", "Unknown")
         
-        avg1 = getattr(row, "Average_Daily_Balance1", 0)
-        avg2 = getattr(row, "Average_Daily_Balance2", 0)
-        avg3 = getattr(row, "Average_Daily_Balance3", 0)
+        # 處理 Unique ID (有時候會有型別問題)
+        raw_id = row.get("Unique Client ID", "")
+        Unique_Client_ID = str(raw_id) if pd.notna(raw_id) else ""
         
-        days1 = getattr(row, "Days_in_Period1", 0)
-        days2 = getattr(row, "Days_in_Period2", 0)
-        days3 = getattr(row, "Days_in_Period3", 0)
+        avg1 = row.get("Average Daily Balance1", 0)
+        avg2 = row.get("Average Daily Balance2", 0)
+        avg3 = row.get("Average Daily Balance3", 0)
         
-        fee1 = getattr(row, "Fee1", 0)
-        fee2 = getattr(row, "Fee2", 0)
-        fee3 = getattr(row, "Fee3", 0)
+        days1 = row.get("Days in Period1", 0)
+        days2 = row.get("Days in Period2", 0)
+        days3 = row.get("Days in Period3", 0)
         
-        date1 = getattr(row, "Date1", "")
-        date2 = getattr(row, "Date2", "")
-        date3 = getattr(row, "Date3", "")
+        fee1 = row.get("Fee1", 0)
+        fee2 = row.get("Fee2", 0)
+        fee3 = row.get("Fee3", 0)
         
-        Total = getattr(row, "Total", 0)
-        Eval = getattr(row, "Eval", "")
+        date1 = row.get("Date1", "")
+        date2 = row.get("Date2", "")
+        date3 = row.get("Date3", "")
+        
+        Total = row.get("Total", 0)
+        Eval = row.get("Eval", "")
 
-        # 準備寫入模板的資料
+        # 準備寫入模板的資料 (21 個欄位)
         template_data = [
-            Eval, f"${Total:,.2f}", f"Client Name(s): {Client}", str(Unique_Client_ID)[:10],
-            "0.25%", f"Billing Cycle: {Eval}", "Address: ????", f"Fee Calculation {str(Unique_Client_ID)[:10]}",
-            date1, avg1, days1, f"${fee1:,.2f}",
-            date2, avg2, days2, f"${fee2:,.2f}",
-            date3, avg3, days3, f"${fee3:,.2f}",
-            f"${Total:,.2f}"
+            # 1-8 Header
+            Eval,                                   # 1
+            f"${Total:,.2f}",                       # 2
+            f"Client Name(s): {Client}",            # 3
+            str(Unique_Client_ID)[:10],             # 4
+            "0.25%",                                # 5
+            f"Billing Cycle: {Eval}",               # 6
+            "Address: ????",                        # 7
+            f"Fee Calculation {str(Unique_Client_ID)[:10]}", # 8
+            
+            # 9-20 Content Rows
+            date1, avg1, days1, f"${fee1:,.2f}",    # Row 18
+            date2, avg2, days2, f"${fee2:,.2f}",    # Row 19
+            date3, avg3, days3, f"${fee3:,.2f}",    # Row 20
+            
+            # 21 Footer
+            f"${Total:,.2f}"                        # 21
         ]
 
         # 處理檔名中的特殊字元
@@ -306,9 +324,12 @@ if start_button:
             if not df_result.empty:
                 st.success(f"資料處理完成！共 {len(df_result)} 位合格客戶。")
                 
-                # 預覽數據
-                with st.expander("點擊查看處理後的數據預覽"):
-                    st.dataframe(df_result[['Client', 'Eval', 'Total', 'Fee1', 'Fee2', 'Fee3']].head(10))
+                # 預覽數據 (重要：這裡可以檢查欄位是否正確生成)
+                st.subheader("📊 數據預覽 (請確認 Fee, Balance, Date 是否正確)")
+                preview_cols = ['Client', 'Total', 'Fee1', 'Fee2', 'Fee3', 'Date1', 'Date2', 'Date3', 'Average Daily Balance1']
+                # 只顯示存在的欄位
+                valid_preview = [c for c in preview_cols if c in df_result.columns]
+                st.dataframe(df_result[valid_preview].head(10))
                 
                 # Step 2: 生成 Excel
                 xlsx_output_dir = os.path.join(tmpdirname, "XLSX")
